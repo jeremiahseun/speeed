@@ -40,6 +40,15 @@ pub struct TransferConfig {
     /// Largest single file we will pre-allocate for.
     #[uniffi(default = 2199023255552)]
     pub max_file_bytes: u64,
+    /// Pick up where an interrupted transfer left off. On iOS this is what
+    /// turns backgrounding from a lost transfer into a brief pause.
+    #[uniffi(default = true)]
+    pub resume: bool,
+    /// Bytes written between resume checkpoints. Each costs an fsync, so this
+    /// trades how much is re-sent after an interruption against write
+    /// throughput. Zero leaves only the final checkpoint.
+    #[uniffi(default = 67108864)]
+    pub checkpoint_bytes: u64,
 }
 
 impl Default for TransferConfig {
@@ -50,6 +59,8 @@ impl Default for TransferConfig {
             chunk_size_bytes: 4 * 1024 * 1024,
             max_streams: 32,
             max_file_bytes: 2 << 40,
+            resume: true,
+            checkpoint_bytes: 64 * 1024 * 1024,
         }
     }
 }
@@ -66,6 +77,8 @@ impl TransferConfig {
             chunk_size: self.chunk_size_bytes,
             max_streams: self.max_streams,
             max_file_bytes: self.max_file_bytes,
+            resume: self.resume,
+            checkpoint_bytes: self.checkpoint_bytes,
         }
     }
 }

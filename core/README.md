@@ -42,4 +42,5 @@ collide only after Windows normalization (`report.` vs `report`).
 **Bitmap ordering is a durability requirement, not a detail.** A chunk's bit is
 set only after its hash verifies *and* the region is fsynced. Setting it on
 write completion alone lets a power loss leave a chunk marked present that
-resume will then never repair.
+resume will then never repair. The same reasoning drives checkpoint ordering in
+`resume`: the bitmap is snapshotted before the fsync, never after.

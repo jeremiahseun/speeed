@@ -45,6 +45,9 @@ Pure logic, no I/O, no async runtime.
 - `send` / `recv` — one whole chunk per stream, so no cross-stream reassembly.
 - `progress` — `ProgressSink` plus `Throttled`, rate-limiting UI updates to
   ~10 Hz while never dropping the first or last.
+- `resume` — durable `.aether_state` sidecar, plus a rebuild-by-verification
+  fallback. **Resume across reconnect works end to end**: an interrupted
+  transfer leaves a record, and the next attempt sends only what is missing.
 
 ### `core/crates/aetherlink-cli` — harness
 `aetherlink recv | send | bench`. The `bench` subcommand settles PRD §2.4.
@@ -61,7 +64,7 @@ take `&self` (state lives behind interior mutability), and foreign traits arrive
 as `Arc<dyn Trait>`, not `Box`.
 
 ### Verified results
-- **74 tests green**, clippy clean at `-D warnings`, CI on every push.
+- **87 tests green**, clippy clean at `-D warnings`, CI on every push.
 - **1.24 GB/s peak** over loopback with full TLS + BLAKE3 — meets the 1.2 GB/s
   software-ceiling gate. Caveats in `benchmarks.md`.
 
@@ -110,11 +113,6 @@ targets and possibly the transport choice change. Do not skip this.
 - [ ] PhotoKit ingestion with `shouldMoveFile = true`, preserving `creationDate`
 
 ### 5. Engine work still outstanding
-- [ ] **Resume across reconnect.** The bitmap and the protocol are done and the
-      sender already transmits only missing chunks. What is missing: rebuilding
-      a bitmap from a staging file left by an interrupted session (verify each
-      chunk against the manifest, set bits for those that pass), and persisting
-      `.aether_state` between runs.
 - [ ] **Real pre-allocation.** `io::SinkFile::create` uses `set_len`, which
       reserves size but not blocks. Needs `fallocate` on Android and
       `F_PREALLOCATE` on iOS; both want a `libc` dependency.
@@ -152,6 +150,19 @@ peer's Hello and drives an accept loop; file size drives pre-allocation. Both
 are capped in `Config`. If you add another value that comes from the peer,
 assume it is hostile.
 
+**Resume trusts a record only when it validates.** The `.aether_state` sidecar
+is rejected — silently, falling back to a full transfer — if its checksum fails,
+if its root hash, file size or chunk size disagree with the manifest, or if the
+staging file is no longer the length we reserved. Re-transferring is cheap;
+trusting a stale record produces a corrupt file that nothing later repairs. If
+you add a field to the record, add it to the identity check too.
+
+**Checkpoint ordering is the correctness argument, not an optimisation.** The
+bitmap is snapshotted *before* the fsync, so every bit in the snapshot is a
+write that had already completed. Snapshotting after the fsync would invert
+this and could record a chunk still sitting in the page cache — which is
+exactly the silently-corrupt-file failure the design exists to prevent.
+
 **`Cargo.lock` is gitignored.** Fine for a library workspace, but pin it before
 shipping binaries so builds are reproducible.
 
@@ -161,7 +172,7 @@ shipping binaries so builds are reproducible.
 
 ```sh
 cd core
-cargo test --workspace                       # 74 tests
+cargo test --workspace                       # 87 tests
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 
@@ -249,3 +260,10 @@ final class Transfers: TransferObserver {
 - A session is reusable: after a transfer completes, fails, or is cancelled, it
   can start another. Only one at a time — a second concurrent `start_*` throws
   `EngineException.Busy`.
+- **Resume is on by default and needs nothing from the app.** Point a retry at
+  the same `outputDir` with the same files and only the missing chunks travel.
+  On iOS this is what turns backgrounding from a lost transfer into a pause:
+  checkpoint on background, start again on return.
+- `checkpointBytes` (default 64 MB) sets how much is re-sent after an
+  interruption. Each checkpoint costs an fsync, so lowering it trades write
+  throughput for finer resume granularity.

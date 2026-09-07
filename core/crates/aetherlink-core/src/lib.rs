@@ -12,6 +12,7 @@ pub mod control;
 pub mod io;
 pub mod progress;
 pub mod recv;
+pub mod resume;
 pub mod send;
 pub mod tls;
 
@@ -42,6 +43,13 @@ pub struct Config {
     /// Largest single file we will pre-allocate for. Stops a hostile manifest
     /// from filling the disk before the user has seen a prompt.
     pub max_file_bytes: u64,
+    /// Pick up where an interrupted transfer left off, rather than starting
+    /// the file again from byte zero.
+    pub resume: bool,
+    /// Bytes written between resume checkpoints. Each costs an fsync, so this
+    /// trades resume granularity against write throughput. Zero disables
+    /// checkpointing, leaving only the final one.
+    pub checkpoint_bytes: u64,
 }
 
 impl Default for Config {
@@ -52,6 +60,8 @@ impl Default for Config {
             chunk_size: DEFAULT_CHUNK_SIZE,
             max_streams: 32,
             max_file_bytes: 2 << 40, // 2 TiB
+            resume: true,
+            checkpoint_bytes: resume::DEFAULT_CHECKPOINT_BYTES,
         }
     }
 }

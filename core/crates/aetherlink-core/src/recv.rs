@@ -21,6 +21,7 @@ use tokio_rustls::TlsAcceptor;
 use crate::control::{self, Body, ControlMessage, FileProgress, ManifestAccept, TransferComplete};
 use crate::io::{verify_and_write, SinkFile};
 use crate::progress::{NoProgress, ProgressSink};
+use crate::resume::{self, StateKey};
 use crate::tls::HostIdentity;
 use crate::{Config, Error, TransferStats};
 
@@ -30,6 +31,13 @@ struct FileState {
     layout: ChunkLayout,
     chunk_hashes: Vec<Hash>,
     bitmap: Mutex<ChunkBitmap>,
+    /// Identity this file's resume record must match.
+    key: StateKey,
+    /// Bytes written since the last checkpoint.
+    since_checkpoint: AtomicU64,
+    /// Held for the duration of a checkpoint so concurrent workers do not
+    /// stack fsyncs on the same file.
+    checkpointing: Mutex<()>,
 }
 
 /// Runs one receive session and returns once the transfer completes.
@@ -91,6 +99,7 @@ pub async fn receive_with_progress(
     let mut progress = Vec::new();
     let mut seen_paths = std::collections::HashSet::new();
     let mut total_bytes = 0u64;
+    let mut resumed_bytes = 0u64;
 
     for entry in &offer.files {
         let safe_path = match sanitize_relative_path(&entry.relative_path) {
@@ -129,9 +138,35 @@ pub async fn receive_with_progress(
         }
 
         let dest: PathBuf = output_dir.join(&safe_path);
-        let sink = SinkFile::create(&dest, entry.size_bytes, offer.chunk_size)?;
-        let bitmap = ChunkBitmap::new(layout.count());
+        let key = StateKey {
+            root_hash: computed,
+            file_size: entry.size_bytes,
+            chunk_size: offer.chunk_size,
+        };
 
+        // Whether the staging file predates this session decides how hard we
+        // work to find out what it holds. `SinkFile::create` would make it
+        // either way, so ask first.
+        let preexisting = dest.exists();
+        let sink = SinkFile::create(&dest, entry.size_bytes, offer.chunk_size)?;
+
+        let bitmap = if !config.resume {
+            ChunkBitmap::new(layout.count())
+        } else if let Some(recorded) = resume::load(&dest, &key) {
+            // The sidecar validated against this exact manifest.
+            recorded
+        } else if preexisting {
+            // Something is on disk but we have no usable record of it — a
+            // sidecar lost to a hard kill, or a transfer from a build that did
+            // not write one. Hashing what is there costs a full read but
+            // cannot be misled.
+            resume::rebuild_by_verification(&sink, &chunk_hashes)?
+        } else {
+            ChunkBitmap::new(layout.count())
+        };
+
+        // Short final chunk means this can overshoot; clamped below.
+        resumed_bytes += bitmap.set_count() * offer.chunk_size as u64;
         progress.push(FileProgress {
             file_id: entry.file_id,
             have_bitmap: bitmap.as_bytes().to_vec(),
@@ -145,6 +180,9 @@ pub async fn receive_with_progress(
                 layout,
                 chunk_hashes,
                 bitmap: Mutex::new(bitmap),
+                key,
+                since_checkpoint: AtomicU64::new(0),
+                checkpointing: Mutex::new(()),
             }),
         );
     }
@@ -160,7 +198,9 @@ pub async fn receive_with_progress(
 
     // --- data streams -------------------------------------------------------
     let started = std::time::Instant::now();
-    let bytes_written = Arc::new(AtomicU64::new(0));
+    // Seeded with the resumed bytes so a resumed transfer's progress bar picks
+    // up where it left off instead of restarting at zero.
+    let bytes_written = Arc::new(AtomicU64::new(resumed_bytes.min(total_bytes)));
     let files = Arc::new(files);
     let mut workers = Vec::new();
 
@@ -174,6 +214,7 @@ pub async fn receive_with_progress(
         let counter = bytes_written.clone();
         let chunk_size = offer.chunk_size;
         let progress_sink = progress_sink.clone();
+        let checkpoint_bytes = config.checkpoint_bytes;
         workers.push(tokio::spawn(async move {
             drain_stream(
                 &mut stream,
@@ -182,25 +223,45 @@ pub async fn receive_with_progress(
                 chunk_size,
                 progress_sink,
                 total_bytes,
+                checkpoint_bytes,
             )
             .await
         }));
     }
 
+    let mut first_error: Option<Error> = None;
     for worker in workers {
-        worker
-            .await
-            .map_err(|e| Error::Io(format!("stream worker panicked: {e}")))??;
+        let outcome = match worker.await {
+            Ok(result) => result,
+            Err(e) => Err(Error::Io(format!("stream worker panicked: {e}"))),
+        };
+        if let Err(e) = outcome {
+            first_error.get_or_insert(e);
+        }
+    }
+
+    // A dropped connection is precisely what resume exists for, so checkpoint
+    // every file before propagating the error. Without this the next attempt
+    // starts from byte zero and the whole feature is decorative.
+    if let Some(error) = first_error {
+        for state in files.values() {
+            checkpoint(state).await.ok();
+        }
+        return Err(error);
     }
 
     // --- completeness -------------------------------------------------------
     for state in files.values() {
         if !state.bitmap.lock().await.is_complete() {
+            checkpoint(state).await.ok();
             let reason = format!("{} is incomplete", state.sink.path().display());
             abort(&mut control, &reason).await;
             return Err(Error::Incomplete(reason));
         }
         state.sink.sync()?;
+        // The file is done. A stale record here would tell a later transfer to
+        // the same path that it has nothing left to do.
+        resume::discard(state.sink.path());
     }
 
     let bytes = bytes_written.load(Ordering::Relaxed);
@@ -228,6 +289,7 @@ async fn drain_stream(
     chunk_size: u32,
     progress_sink: Arc<dyn ProgressSink>,
     total_bytes: u64,
+    checkpoint_bytes: u64,
 ) -> Result<(), Error> {
     let mut header_buf = [0u8; HEADER_LEN];
     let mut buf: Vec<u8> = Vec::with_capacity(chunk_size as usize);
@@ -321,6 +383,8 @@ async fn drain_stream(
                 progress_sink.on_file_completed(file_id, &state.sink.path().to_string_lossy());
             }
 
+            checkpoint_if_due(&state, expected_len as u64, checkpoint_bytes).await?;
+
             buf = payload;
             buf.clear();
             current = None;
@@ -331,6 +395,54 @@ async fn drain_stream(
         return Err(Error::Incomplete("stream closed mid-chunk".into()));
     }
     Ok(())
+}
+
+/// Checkpoints once enough has been written since the last one.
+///
+/// Ordering is the whole correctness argument. The bitmap is snapshotted
+/// **before** the fsync, so every bit in the snapshot corresponds to a write
+/// that had already completed — the fsync therefore guarantees those bytes are
+/// on the device. A bit set after the snapshot is simply not recorded yet,
+/// which costs at most one re-sent chunk. Snapshotting after the fsync would
+/// invert this and could record a chunk that is still only in the page cache.
+async fn checkpoint_if_due(
+    state: &Arc<FileState>,
+    added: u64,
+    threshold: u64,
+) -> Result<(), Error> {
+    if threshold == 0 {
+        return Ok(());
+    }
+    let before = state.since_checkpoint.fetch_add(added, Ordering::Relaxed);
+    if before + added < threshold {
+        return Ok(());
+    }
+    // One checkpoint at a time per file. A worker that loses the race keeps
+    // transferring rather than queueing behind an fsync.
+    let Ok(_guard) = state.checkpointing.try_lock() else {
+        return Ok(());
+    };
+    state.since_checkpoint.store(0, Ordering::Relaxed);
+    checkpoint(state).await
+}
+
+/// Flushes the file and records what is durably present.
+async fn checkpoint(state: &Arc<FileState>) -> Result<(), Error> {
+    let snapshot = state.bitmap.lock().await.clone();
+    if snapshot.set_count() == 0 {
+        return Ok(());
+    }
+    let file = state.sink.handle();
+    let staging = state.sink.path().to_path_buf();
+    let key = state.key;
+
+    tokio::task::spawn_blocking(move || -> Result<(), Error> {
+        file.sync_data()
+            .map_err(|e| Error::Io(format!("syncing {}: {e}", staging.display())))?;
+        resume::persist(&staging, &key, &snapshot)
+    })
+    .await
+    .map_err(|e| Error::Io(format!("checkpoint worker panicked: {e}")))?
 }
 
 async fn accept_one(
