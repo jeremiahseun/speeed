@@ -96,6 +96,19 @@ fn reserve_blocks(_file: &File, _size: u64) -> Result<(), ReserveError> {
     Err(Unsupported)
 }
 
+/// System page size. `madvise` operates on whole pages, so callers that want
+/// to release a byte range have to round it to page boundaries themselves.
+pub fn page_size() -> usize {
+    // SAFETY: `sysconf` with a valid name; the result is a positive long on
+    // every platform we target.
+    let raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if raw > 0 {
+        raw as usize
+    } else {
+        4096
+    }
+}
+
 /// Pins a socket to one network interface by index.
 ///
 /// This exists for iOS. The direct link has no internet gateway, so the OS will

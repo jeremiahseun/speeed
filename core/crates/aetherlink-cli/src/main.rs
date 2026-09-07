@@ -85,6 +85,10 @@ struct Tuning {
     frame_bytes: u32,
     #[arg(long, default_value_t = 4 * 1024 * 1024)]
     chunk_bytes: u32,
+    /// Keep the sender's pages mapped after transmitting them. For measuring
+    /// what releasing them is worth; not a setting to ship with.
+    #[arg(long)]
+    keep_read_pages: bool,
 }
 
 impl Tuning {
@@ -93,6 +97,7 @@ impl Tuning {
             stream_count: self.streams,
             frame_size: self.frame_bytes,
             chunk_size: self.chunk_bytes,
+            release_read_pages: !self.keep_read_pages,
             ..Config::default()
         }
     }

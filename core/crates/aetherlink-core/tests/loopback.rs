@@ -211,3 +211,64 @@ async fn a_traversal_path_in_the_manifest_is_rejected() {
         other => panic!("traversal must be refused, got {other:?}"),
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn releasing_pages_behind_the_cursor_does_not_corrupt_the_stream() {
+    // The failure this guards against is a race: one stream releasing pages
+    // that a slower stream is still reading. It needs many chunks spread
+    // across many streams to surface, so this is deliberately larger and
+    // wider than the other loopback tests.
+    let data = payload(64 * 1024 * 200 + 4321, 31);
+    let config = Config {
+        stream_count: 8,
+        chunk_size: 64 * 1024,
+        frame_size: 16 * 1024,
+        release_read_pages: true,
+        ..Config::default()
+    };
+
+    let (_dst, got) = transfer(vec![("big.bin", data.clone())], config)
+        .await
+        .unwrap();
+    assert_eq!(got[0].1.len(), data.len());
+    assert_eq!(
+        blake3::hash(&got[0].1),
+        blake3::hash(&data),
+        "page release corrupted the transfer"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn releasing_pages_changes_nothing_observable() {
+    // Same payload with the release turned off: the bytes on the wire must be
+    // identical either way. It is a memory hint, not a protocol change.
+    let data = payload(64 * 1024 * 40 + 99, 32);
+    let base = Config {
+        stream_count: 4,
+        chunk_size: 64 * 1024,
+        frame_size: 16 * 1024,
+        ..Config::default()
+    };
+
+    let (_a, with) = transfer(
+        vec![("f.bin", data.clone())],
+        Config {
+            release_read_pages: true,
+            ..base
+        },
+    )
+    .await
+    .unwrap();
+    let (_b, without) = transfer(
+        vec![("f.bin", data.clone())],
+        Config {
+            release_read_pages: false,
+            ..base
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(blake3::hash(&with[0].1), blake3::hash(&data));
+    assert_eq!(blake3::hash(&without[0].1), blake3::hash(&with[0].1));
+}

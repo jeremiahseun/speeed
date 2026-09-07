@@ -68,6 +68,10 @@ pub struct Config {
     /// knob exists for measuring, not because the default is wrong.
     pub socket_send_buffer_bytes: u32,
     pub socket_recv_buffer_bytes: u32,
+    /// Release the sender's mapped pages once they have been transmitted, so a
+    /// large file does not walk its whole length through the page cache and
+    /// evict everything else. Off only for measuring what it is worth.
+    pub release_read_pages: bool,
 }
 
 impl Default for Config {
@@ -83,6 +87,7 @@ impl Default for Config {
             bound_interface_index: 0,
             socket_send_buffer_bytes: 0,
             socket_recv_buffer_bytes: 0,
+            release_read_pages: true,
         }
     }
 }

@@ -66,6 +66,11 @@ pub struct TransferConfig {
     pub socket_send_buffer_bytes: u32,
     #[uniffi(default = 0)]
     pub socket_recv_buffer_bytes: u32,
+    /// Release the sender's mapped pages once transmitted, so sending a large
+    /// file does not walk its whole length through the page cache and evict
+    /// everything else on the device. Leave this on.
+    #[uniffi(default = true)]
+    pub release_read_pages: bool,
 }
 
 impl Default for TransferConfig {
@@ -81,6 +86,7 @@ impl Default for TransferConfig {
             bound_interface_index: 0,
             socket_send_buffer_bytes: 0,
             socket_recv_buffer_bytes: 0,
+            release_read_pages: true,
         }
     }
 }
@@ -102,6 +108,7 @@ impl TransferConfig {
             bound_interface_index: self.bound_interface_index,
             socket_send_buffer_bytes: self.socket_send_buffer_bytes,
             socket_recv_buffer_bytes: self.socket_recv_buffer_bytes,
+            release_read_pages: self.release_read_pages,
         }
     }
 }

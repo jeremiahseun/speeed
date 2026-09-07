@@ -6,7 +6,7 @@
 //! chunk* at a time, which is what lets the receiver verify on arrival without
 //! reassembling across streams.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -28,6 +28,61 @@ pub struct OutgoingFile {
     pub path: PathBuf,
     pub relative_path: String,
     pub mime_type: String,
+}
+
+/// Tracks which chunks of one file are still being read, so pages behind
+/// *every* stream's cursor can be released.
+///
+/// Chunks leave the queue in order but finish out of order, so the safe
+/// boundary is the **lowest index still in flight**, not the highest
+/// dispatched. Releasing to the latter would drop pages a slower stream is
+/// still reading — which is not a correctness bug on a read-only mapping, since
+/// the page simply re-faults, but it would undo the work by thrashing.
+#[derive(Debug, Default)]
+struct ReadCursor {
+    in_flight: BTreeSet<u64>,
+    /// One past the highest index handed out so far.
+    next_dispatch: u64,
+    /// Byte offset already released.
+    released_to: u64,
+}
+
+impl ReadCursor {
+    /// Registers a chunk as being read. **Must be called while still holding
+    /// the work queue lock**: if a chunk could be popped but not yet
+    /// registered, a faster stream finishing a later chunk would compute a
+    /// boundary past it and release pages it is about to read.
+    fn begin(&mut self, index: u64) {
+        self.in_flight.insert(index);
+        self.next_dispatch = self.next_dispatch.max(index + 1);
+    }
+
+    /// Marks a chunk done and returns the byte range that has become safe to
+    /// release, if enough has accumulated to be worth a syscall.
+    fn finish(
+        &mut self,
+        index: u64,
+        batch: u64,
+        chunk_size: u64,
+        file_size: u64,
+    ) -> Option<(u64, u64)> {
+        self.in_flight.remove(&index);
+        // Empty means everything dispatched is done, so the boundary is the
+        // dispatch point itself.
+        let boundary_chunk = self
+            .in_flight
+            .first()
+            .copied()
+            .unwrap_or(self.next_dispatch);
+        let boundary = boundary_chunk.saturating_mul(chunk_size).min(file_size);
+
+        if boundary.saturating_sub(self.released_to) < batch {
+            return None;
+        }
+        let range = (self.released_to, boundary);
+        self.released_to = boundary;
+        Some(range)
+    }
 }
 
 /// A chunk assigned to whichever stream picks it up next.
@@ -99,7 +154,7 @@ async fn run<S: StreamSource>(
     let mut entries = Vec::with_capacity(files.len());
     for (i, f) in files.iter().enumerate() {
         let src = Arc::new(SourceFile::open(&f.path, config.chunk_size)?);
-        let hashes = src.chunk_hashes()?;
+        let hashes = src.chunk_hashes(config.release_read_pages)?;
         let root = aetherlink_proto::chunk::root_from_chunk_hashes(&hashes);
         entries.push(FileEntry {
             file_id: i as u64,
@@ -174,6 +229,11 @@ async fn run<S: StreamSource>(
     let started = std::time::Instant::now();
     let sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let queue = Arc::new(Mutex::new(queue));
+    let cursors: Arc<Vec<std::sync::Mutex<ReadCursor>>> = Arc::new(
+        (0..sources.len())
+            .map(|_| std::sync::Mutex::new(ReadCursor::default()))
+            .collect(),
+    );
     let sources = Arc::new(sources);
 
     // --- data streams -------------------------------------------------------
@@ -195,30 +255,71 @@ async fn run<S: StreamSource>(
         let frame_size = config.frame_size;
         let progress = progress.clone();
         let sent = sent.clone();
+        let cursors = cursors.clone();
+        let release_pages = config.release_read_pages;
         workers.push(tokio::spawn(async move {
             let mut header_buf = [0u8; HEADER_LEN];
             loop {
-                let item = { queue.lock().await.pop_front() };
+                // Popping and registering happen together under the queue
+                // lock, so no chunk is ever dispatched-but-unregistered — see
+                // `ReadCursor::begin`.
+                let item = {
+                    let mut queue = queue.lock().await;
+                    let item = queue.pop_front();
+                    if let Some(item) = item {
+                        if release_pages {
+                            cursors[item.file_index]
+                                .lock()
+                                .unwrap()
+                                .begin(item.chunk_index);
+                        }
+                    }
+                    item
+                };
                 let Some(item) = item else { break };
 
                 let src = &sources[item.file_index];
                 let (chunk_offset, chunk_len) = src.layout().range(item.chunk_index)?;
-                let payload = src.chunk(item.chunk_index)?;
 
-                // One chunk goes out as a run of frames on this stream, in
-                // order, so the receiver can accumulate without cross-stream
-                // bookkeeping.
-                for (n, part) in payload.chunks(frame_size as usize).enumerate() {
-                    let offset = chunk_offset + (n as u64 * frame_size as u64);
-                    FrameHeader::new(
-                        MsgType::FileData,
-                        item.file_index as u64,
-                        offset,
-                        part.len() as u32,
-                    )
-                    .encode(&mut header_buf);
-                    stream.write_all(&header_buf).await?;
-                    stream.write_all(part).await?;
+                // The borrow of the mapping is scoped so it has ended before
+                // any page release below. Holding it across the release would
+                // break the contract on `SourceFile::release_range`.
+                {
+                    let payload = src.chunk(item.chunk_index)?;
+
+                    // One chunk goes out as a run of frames on this stream, in
+                    // order, so the receiver can accumulate without
+                    // cross-stream bookkeeping.
+                    for (n, part) in payload.chunks(frame_size as usize).enumerate() {
+                        let offset = chunk_offset + (n as u64 * frame_size as u64);
+                        FrameHeader::new(
+                            MsgType::FileData,
+                            item.file_index as u64,
+                            offset,
+                            part.len() as u32,
+                        )
+                        .encode(&mut header_buf);
+                        stream.write_all(&header_buf).await?;
+                        stream.write_all(part).await?;
+                    }
+                }
+
+                if release_pages {
+                    let chunk_size = src.layout().chunk_size() as u64;
+                    let released = cursors[item.file_index].lock().unwrap().finish(
+                        item.chunk_index,
+                        crate::io::RELEASE_BATCH_BYTES.max(chunk_size),
+                        chunk_size,
+                        src.size(),
+                    );
+                    if let Some((start, end)) = released {
+                        // SAFETY: `finish` returns only the range below the
+                        // lowest chunk still in flight, so every chunk it
+                        // covers has been fully written to a socket and its
+                        // borrow dropped. The scope above ensures this
+                        // worker's own borrow has ended too.
+                        unsafe { src.release_range(start, end) };
+                    }
                 }
 
                 let done = sent.fetch_add(chunk_len as u64, std::sync::atomic::Ordering::Relaxed)
@@ -275,4 +376,129 @@ fn rand_bytes() -> [u8; 16] {
     let mut out = [0u8; 16];
     out.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CS: u64 = 4 * 1024 * 1024;
+    const FILE: u64 = CS * 100;
+
+    fn finish(c: &mut ReadCursor, index: u64) -> Option<(u64, u64)> {
+        c.finish(index, CS, CS, FILE)
+    }
+
+    #[test]
+    fn releases_behind_a_single_stream_as_it_advances() {
+        let mut c = ReadCursor::default();
+        c.begin(0);
+        assert_eq!(finish(&mut c, 0), Some((0, CS)));
+        c.begin(1);
+        assert_eq!(finish(&mut c, 1), Some((CS, 2 * CS)));
+    }
+
+    #[test]
+    fn never_releases_a_chunk_that_is_still_in_flight() {
+        let mut c = ReadCursor::default();
+        // Four streams take chunks 0..4; the last one finishes first.
+        for i in 0..4 {
+            c.begin(i);
+        }
+        assert_eq!(
+            finish(&mut c, 3),
+            None,
+            "chunk 0 is still being read, so nothing may be released"
+        );
+        assert_eq!(finish(&mut c, 2), None);
+        assert_eq!(finish(&mut c, 1), None);
+
+        // Only once the slowest stream finishes does the boundary move — and
+        // then it jumps past everything that completed while it was blocked.
+        assert_eq!(finish(&mut c, 0), Some((0, 4 * CS)));
+    }
+
+    #[test]
+    fn the_boundary_follows_the_slowest_stream_not_the_fastest() {
+        let mut c = ReadCursor::default();
+        for i in 0..3 {
+            c.begin(i);
+        }
+        assert_eq!(
+            finish(&mut c, 0),
+            Some((0, CS)),
+            "chunk 1 is now the slowest"
+        );
+        c.begin(3);
+        assert_eq!(finish(&mut c, 2), None, "chunk 1 still holds the boundary");
+        // Only when the slow one lands does the boundary jump past 2 as well.
+        assert_eq!(finish(&mut c, 1), Some((CS, 3 * CS)));
+    }
+
+    #[test]
+    fn holds_back_until_a_whole_chunk_is_worth_releasing() {
+        // A file whose chunks are shorter than one release batch: the boundary
+        // advances but no syscall is made until it clears the threshold.
+        let mut c = ReadCursor::default();
+        c.begin(0);
+        assert_eq!(
+            c.finish(0, CS, CS, CS / 4),
+            None,
+            "a partial chunk is not worth a syscall"
+        );
+    }
+
+    #[test]
+    fn released_offsets_never_overlap_or_go_backwards() {
+        let mut c = ReadCursor::default();
+        let mut last_end = 0u64;
+        // Dispatch four at a time and complete them in reverse, repeatedly —
+        // the pattern most likely to produce an overlapping range.
+        for round in 0..10u64 {
+            let base = round * 4;
+            for i in 0..4 {
+                c.begin(base + i);
+            }
+            for i in (0..4).rev() {
+                if let Some((start, end)) = finish(&mut c, base + i) {
+                    assert_eq!(
+                        start, last_end,
+                        "ranges must be contiguous, not overlapping"
+                    );
+                    assert!(end > start);
+                    last_end = end;
+                }
+            }
+        }
+        assert_eq!(
+            last_end,
+            40 * CS,
+            "everything dispatched should end up released"
+        );
+    }
+
+    #[test]
+    fn a_released_range_never_extends_past_the_end_of_the_file() {
+        // Three chunks, the last one short. Releasing past the mapping would
+        // be a `madvise` on memory we do not own.
+        let file_size = CS * 2 + 1234;
+        let mut c = ReadCursor::default();
+        for i in 0..3 {
+            c.begin(i);
+        }
+        let mut last_end = 0;
+        for i in 0..3 {
+            if let Some((_, end)) = c.finish(i, CS, CS, file_size) {
+                assert!(end <= file_size, "released past the end of the mapping");
+                last_end = end;
+            }
+        }
+        // The 1234-byte tail stays mapped: below the release threshold, and
+        // the mapping is dropped moments later anyway.
+        assert_eq!(last_end, 2 * CS);
+        assert!(
+            file_size - last_end < CS,
+            "at most one chunk is ever left behind"
+        );
+    }
 }

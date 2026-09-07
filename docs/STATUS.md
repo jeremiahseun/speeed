@@ -52,6 +52,8 @@ Pure logic, no I/O, no async runtime.
   and socket buffer sizing.
 - `link` — `StreamSource`, which separates *who dials* from *who sends*, so the
   network host can transmit as well as receive.
+- Page release behind the sender's read cursor: peak RSS no longer tracks file
+  size (960 MB → 211–631 MB on a 1 GB file).
 
 ### `core/crates/aetherlink-cli` — harness
 `aetherlink recv | send | bench`. The `bench` subcommand settles PRD §2.4.
@@ -68,7 +70,7 @@ take `&self` (state lives behind interior mutability), and foreign traits arrive
 as `Arc<dyn Trait>`, not `Box`.
 
 ### Verified results
-- **99 tests green**, clippy clean at `-D warnings`, CI on every push.
+- **109 tests green**, clippy clean at `-D warnings`, CI on every push.
 - **1.24 GB/s peak** over loopback with full TLS + BLAKE3 — meets the 1.2 GB/s
   software-ceiling gate. Caveats in `benchmarks.md`.
 
@@ -122,8 +124,7 @@ targets and possibly the transport choice change. Do not skip this.
       MVP needs it.
 - [ ] Adaptive stream count and frame size under thermal pressure (Sprint 4;
       needs thermal signals from the platform layer)
-- [ ] `MADV_DONTNEED` behind the sender's read cursor, so a 10 GB file does not
-      evict the page cache (PRD §5.5 asks for it; not yet implemented)
+
 
 ### 6. Spec corrections to fold back into PRD-v1.1
 - [ ] §5.3 says the frame header is 24 bytes. Its own fields sum to 28; the
@@ -174,6 +175,22 @@ returns an error naming the alternative rather than silently doing nothing.
 **Without one or the other, Android routes our sockets to mobile data and the
 transfer fails silently** — the direct link has no gateway.
 
+**Releasing pages is only safe because of the read cursor.** `MADV_DONTNEED` is
+behind memmap2's `unsafe` API, and the contract is that no live slice may
+overlap the released range. Chunks are dispatched in order but finish out of
+order, so the safe boundary is the **lowest chunk still in flight**, never the
+highest dispatched. Two details hold that up: a chunk is registered as in-flight
+*while the work-queue lock is still held* (otherwise a fast stream could release
+pages a slower one is about to read), and the mapping borrow is scoped to end
+before the release. Change either and the invariant is gone with nothing to
+catch it.
+
+**Measuring memory: use `VmRSS`, sampled.** `mincore` reports page-cache
+residency, which this deliberately does not change; `VmHWM` is a high-water mark
+that never comes down. Both read as "the feature does nothing". And equalise
+page-cache state between A/B runs or the first run pays for the disk read and
+the second looks twice as fast. See `benchmarks.md`.
+
 **`Cargo.lock` is gitignored.** Fine for a library workspace, but pin it before
 shipping binaries so builds are reproducible.
 
@@ -183,7 +200,7 @@ shipping binaries so builds are reproducible.
 
 ```sh
 cd core
-cargo test --workspace                       # 99 tests
+cargo test --workspace                       # 109 tests
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 

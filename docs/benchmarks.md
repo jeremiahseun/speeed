@@ -101,6 +101,51 @@ CLI check of the host-sends direction, 40 MB over loopback:
 sent        1099.88 MB/s   received    1095.22 MB/s   bytes match
 ```
 
+---
+
+## Page release behind the sender's cursor
+
+`MADV_DONTNEED` behind the read cursor, so sending a large file does not walk
+its whole length through the page cache. Measured on a 1 GB file over loopback,
+sender in its own process, peak `VmRSS` sampled during the transfer.
+
+| | Peak RSS | Throughput |
+|---|---|---|
+| Release **off** | **960 MB** every run | 231 / 821 / 642 MB/s |
+| Release **on** | 631 / 268 / 211 MB | 604 / 322 / 336 MB/s |
+
+**The property that matters is not the average, it is the shape.** With release
+off, peak RSS equals file size, every time — a 10 GB transfer maps 10 GB. With
+it on, it does not track file size at all. The spread (211–631 MB) is how fast
+pages fault in versus how fast the 32 MB batches release them, which depends on
+cache warmth.
+
+Throughput differs by more than 2× *in both directions* across runs, so this
+container cannot resolve a throughput effect. Do not read one from the table.
+
+### Three measurement mistakes worth recording
+
+Getting this number right took three tries, and each wrong answer was
+confidently wrong.
+
+1. **`mincore` showed nothing.** On a file-backed mapping it reports whether a
+   page is in the *page cache*, which `MADV_DONTNEED` deliberately does not
+   change — leaving the page cached is what makes a re-fault cheap. RSS is the
+   metric; `/proc/self/statm` is the instrument.
+2. **`VmHWM` showed nothing.** It is a high-water mark, so it records the peak
+   *before* any release and never comes down. Instantaneous `VmRSS` has to be
+   sampled during the transfer.
+3. **The first A/B showed a 3× slowdown that did not exist.** Runs were ordered
+   on-then-off, so the first paid to read the file from disk and the second
+   inherited a warm cache. Equalising cache state before every run (`cat file >
+   /dev/null`) made the difference vanish.
+
+The genuine bug the exercise did find: `chunk_hashes` touches the whole file to
+build the manifest *before* any byte is sent, so peak RSS was set there and
+releasing during the send changed nothing. The hashing pass now releases behind
+itself too, above a 128 MB threshold — below that, keeping the file cached is
+cheap and makes the send pass a memory read.
+
 ### Reproducing
 
 ```sh
