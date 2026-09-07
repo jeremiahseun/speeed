@@ -26,6 +26,7 @@ cross-platform local transfer app that exists.
 | 9 | <3.5 s QR-scan-to-socket | iOS shows a non-suppressible system join prompt; GO bring-up is 1.5–3 s; DHCP adds 1–3 s. | Restated to **≤12 s cold, P50**, measured and owned as a real number. |
 | 10 | `SO_BINDTODEVICE` on iOS | Linux-only. Darwin's equivalent is `IP_BOUND_IF` / `NWParameters.requiredInterfaceType`. | Corrected in §6.2. |
 | 11 | — (absent) | iOS 14+ requires **Local Network** permission for *any* local-subnet traffic; Android 13+ requires `POST_NOTIFICATIONS` for the foreground service. | Added to §6. |
+| 13 | Fallback order is fixed: direct link always beats a shared router | A P2P group that lands on 2.4 GHz (Tier D, ~14 min for 10 GB) is *slower* than the user's own 5 GHz router (Tier C, ~6 min). Hardcoding "direct wins" picks 14 minutes over 6. | **Band-aware tier selection** (§4.5): read the group's actual frequency and fall *up* to the shared LAN when the direct link came up on 2.4 GHz. |
 | 12 | Server component | The product is peer-to-peer by definition; a backend adds cost, privacy surface, and no MVP capability. | **No server in v1.** See §9 for what a v2 backend would be for. |
 
 ---
@@ -56,7 +57,7 @@ transfer to devices without the app (see §9.1).
 Throughput is a property of the radio pair, not of our code, once the software stops
 being the bottleneck. So targets are stated per hardware tier. **The engineering
 commitment is that software is never the limiting factor** — validated by the
-loopback benchmark in §2.2.
+loopback benchmark in §2.4.
 
 ### 2.1 Throughput tiers
 
@@ -71,14 +72,58 @@ Measurement condition for all tiers: single 10 GB file, 1 m line of sight, both 
 >50% battery, not thermally throttled, airplane-mode-off but no other Wi-Fi client
 associated.
 
-### 2.2 Software-ceiling gate (the number that is actually ours)
+### 2.2 Time to move 10 GB
+
+Derived from §2.1. 10 GB is taken as 10,000 MB decimal. "Transfer" is the wire time
+alone; "wall clock" adds the §2.3 connect budget and the receiver-side ingestion cost,
+which is the number the user actually experiences.
+
+| Tier | Rate | Transfer (fast → slow) | Midpoint | Wall clock, iOS receiving | Wall clock, Android receiving |
+|---|---|---|---|---|---|
+| **A** | 85–110 MB/s | 1:31 → 1:58 | **1:43** | ~1:55 | ~2:15 |
+| **B** | 45–70 MB/s | 2:23 → 3:42 | **2:54** | ~3:06 | ~3:26 |
+| **C** | 20–35 MB/s | 4:46 → 8:20 | **6:04** | ~6:16 | ~6:36 |
+| **D** | 8–16 MB/s | 10:25 → 20:50 | **13:53** | ~14:05 | ~14:25 |
+
+The asymmetry in the last two columns is real and worth designing around: iOS ingestion
+is a PhotoKit file *move* and costs roughly nothing, while Android's MediaStore insert
+is a ContentResolver stream copy — about 20 s for 10 GB on UFS (§7.1). Android-receiving
+transfers must therefore show "Saving to Gallery" as a distinct progress state rather
+than appearing to stall at 100%.
+
+> **Note on v1.0's DoD.** The old checklist required 10 GB in under 105 s. That is Tier A
+> at the very top of its range with zero connect or ingestion overhead — not a gate that
+> can be held on real hardware. Replaced by the per-tier targets above.
+
+### 2.3 Competitive position — where each tier actually lands
+
+LocalSend never creates a link; it always rides the user's existing router, so its
+ceiling is that router's, and Dart/Flutter overhead on a single HTTP stream keeps it
+well under the radio. Phone-to-phone on a decent 5 GHz network it lands around
+**15–35 MB/s**. (Estimated from the architecture, not measured by us — Sprint 0 confirms
+it with a side-by-side run on the same hardware.)
+
+| Tier | vs. LocalSend | Reading |
+|---|---|---|
+| **A** | **3–4×** | The demo number |
+| **B** | **~2×** | The real, repeatable win — and the ship gate |
+| **C** | **Parity** | We match LocalSend at its best |
+| **D** | **Worse** | Below LocalSend on a 5 GHz router; ≈ SHAREit/Xender territory |
+
+**Tier D is the one place we lose, and the engine is not why.** At 2.4 GHz the radio is
+the wall — 72–144 Mbps PHY at 20/40 MHz — so a fast engine and a slow one converge. No
+amount of Rust fixes it. This is precisely what motivates band-aware tier selection
+(§4.5): Tier D's job is narrow — both devices on 2.4-only, or no shared network at all —
+and it must never be chosen over an available 5 GHz path.
+
+### 2.4 Software-ceiling gate (the number that is actually ours)
 
 Over loopback / a wired 10 GbE link between two dev machines, `aetherlink-core` must
 sustain **≥ 1.2 GB/s** encrypted with full BLAKE3 verification. On device, over
 `localhost`, **≥ 400 MB/s**. If the engine can do 10× the radio, the radio is honestly
 the limit and Tier B/C results are the hardware's fault, not ours.
 
-### 2.3 Other KPIs
+### 2.5 Other KPIs
 
 | Metric | Target | Note |
 |---|---|---|
@@ -140,7 +185,8 @@ much lower, ~10–25 MB/s) ceiling. Scoped out explicitly.
 
 ### 4.2 Android host: three-tier link strategy
 
-Attempt in order, fall back on failure, surface the achieved tier in the UI:
+Three link options, selected by measured band rather than fixed priority (§4.5). The
+achieved tier is always surfaced in the UI.
 
 **Tier 1 — Wi-Fi Direct Group Owner, 5 GHz (primary):**
 ```kotlin
@@ -166,9 +212,11 @@ record it in telemetry.
 Read the assigned SSID/passphrase from `reservation.softApConfiguration` (API 30+).
 Check the resulting band; if 2.4 GHz, show the Tier-D banner.
 
-**Tier 3 — Existing shared LAN:** Both devices already on the same router. Slowest
-(double-hop) but zero-friction. Discovery via mDNS (`_aetherlink._tcp`). This is the
-LocalSend model and belongs in the product as a graceful floor, not as an embarrassment.
+**Tier 3 — Existing shared LAN:** Both devices already on the same router. Pays a
+double hop, but zero friction and — crucially — often on 5 GHz. Discovery via mDNS
+(`_aetherlink._tcp`). This is the LocalSend topology, and it belongs in the product as a
+first-class option, not as an embarrassment: on a good router it beats a 2.4 GHz direct
+link outright.
 
 ### 4.3 iOS client: joining
 
@@ -204,6 +252,46 @@ The P2P group has no internet gateway. Both OSes will try to route around it.
   sockets to mobile data and the transfer silently fails.
 
 ---
+
+### 4.5 Band-aware tier selection
+
+A fixed "direct beats shared" ladder is wrong, and §2.2 shows why: a P2P group that
+lands on 2.4 GHz moves 10 GB in ~14 minutes, while the user's own 5 GHz router would do
+it in ~6. Hardcoding the preference picks the 14-minute path while a better one sits
+unused. **The link tier is chosen on measured frequency, not on topology.**
+
+```kotlin
+// After createGroup() succeeds, before generating the QR:
+val goIs5Ghz  = group.frequency >= 4900          // WifiP2pGroup.getFrequency()
+val staIs5Ghz = wifiManager.connectionInfo.frequency >= 4900   // 0 if unassociated
+
+when {
+    goIs5Ghz  -> useTier1()                        // direct 5 GHz: always best
+    staIs5Ghz -> { removeGroup(); useTier3() }      // 2.4 GHz direct loses to a 5 GHz router
+    else      -> useTier1()                        // nothing better exists; Tier D it is
+}
+```
+
+Selection rules, in order:
+
+1. **Direct link on 5 GHz → always Tier 1.** No hop, no contention. Nothing beats it.
+2. **Direct link on 2.4 GHz, but both devices are on the same 5 GHz network → tear the
+   group down and use Tier 3.** This is the case the fixed ladder got wrong. Confirm
+   same-network *and* peer reachability before releasing the group, so a failed probe
+   falls back to the direct link rather than to nothing.
+3. **Direct link on 2.4 GHz with no better shared path → Tier 1 at Tier-D speed**, with
+   the speed-limit banner. This is the genuine floor.
+
+Two consequences for the rest of the spec:
+
+- The iOS side must learn which path was chosen *before* the QR is generated, because
+  the payload differs: Tier 1 carries SSID and passphrase, Tier 3 carries only host IP,
+  port and key fingerprint. Tier 3 needs no join step and therefore triggers no iOS
+  system prompt, which also makes it the **fastest to connect** — roughly 3–4 s against
+  Tier 1's ~12 s.
+- Sprint 0 must record each group's *actual* frequency. How often a 5 GHz request
+  silently lands on 2.4 GHz determines how often this path runs, and it is not yet known.
+
 
 ## 5. Transport & Engine
 
@@ -517,12 +605,14 @@ iOS↔iOS (§4.1), full-duplex simultaneous bidirectional transfer, desktop clie
 
 **Sprint 0 — Hardware truth (1 week).** Before writing engine code, prove the radio.
 Bring up a Wi-Fi Direct 5 GHz GO on three Android devices, join from two iPhones, and
-measure raw `iperf3` throughput. **This single number determines whether the rest of
+measure raw `iperf3` throughput — logging each group's **actual** frequency, not the
+requested one — and run LocalSend on the same pairs for a like-for-like baseline.
+**This single number determines whether the rest of
 the plan is worth building as specified.** If real-world Tier-B lands at 25 MB/s rather
 than 55, the targets and possibly the transport choice change.
 
 **Sprint 1 — Core engine.** `aetherlink-core`: multi-TCP + rustls, framing, mmap/pwrite
-pipeline, BLAKE3 Merkle, resume state machine. CLI harness. Gate: §2.2 software ceiling.
+pipeline, BLAKE3 Merkle, resume state machine. CLI harness. Gate: §2.4 software ceiling.
 
 **Sprint 2 — Link automation.** Android GO + LOHS + QR generation; iOS join + polling
 readiness detection + QR scan; BLE as secondary discovery; interface pinning both sides.
@@ -540,11 +630,15 @@ frame size under thermal pressure. OEM-killer mitigations. 2,000-small-file batc
 ## 11. Definition of Done
 
 - [ ] Tier B (Wi-Fi 5, 2×2) sustains **≥ 45 MB/s**; Tier A reaches **≥ 85 MB/s**
-- [ ] Software ceiling ≥ 400 MB/s device-loopback, ≥ 1.2 GB/s desktop (§2.2)
+- [ ] Software ceiling ≥ 400 MB/s device-loopback, ≥ 1.2 GB/s desktop (§2.4)
 - [ ] 10 GB single file completes with zero corruption, verified by independent BLAKE3
 - [ ] 2,000 mixed small files (100 KB–5 MB): no crash, no OOM, no leaked fds
 - [ ] 500 forced mid-transfer disconnects: 100% resume, 0 corrupt outputs
 - [ ] Cold connect ≤ 12 s P50 across 5 Android × 3 iOS device pairs
+- [ ] 10 GB completes within the §2.2 wall-clock envelope for the achieved tier
+- [ ] Band-aware selection verified: a forced 2.4 GHz group with a 5 GHz router present
+      falls up to Tier 3 instead of transferring at Tier-D speed
+- [ ] Side-by-side against LocalSend on identical hardware: Tier B ≥ 1.8× its throughput
 - [ ] 2.4 GHz fallback works and shows the speed-limit banner
 - [ ] Files land in Photos and Gallery with correct creation timestamps and EXIF intact
 - [ ] iOS: backgrounding pauses and foregrounding resumes, no data loss, no 2.5.4 violation
