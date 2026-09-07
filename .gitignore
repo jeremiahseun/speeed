@@ -1,0 +1,7 @@
+target/
+Cargo.lock
+.DS_Store
+*.xcuserstate
+local.properties
+.gradle/
+build/

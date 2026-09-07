@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["crates/aetherlink-proto"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+blake3 = "1.5"
+thiserror = "2"
+anyhow = "1"
