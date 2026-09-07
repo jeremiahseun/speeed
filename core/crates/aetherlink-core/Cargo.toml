@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 aetherlink-proto.workspace = true
 blake3.workspace = true
+libc.workspace = true
 memmap2.workspace = true
 prost.workspace = true
 rcgen.workspace = true
@@ -21,4 +22,5 @@ tracing.workspace = true
 aetherlink-proto.workspace = true
 anyhow.workspace = true
 blake3.workspace = true
+libc.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

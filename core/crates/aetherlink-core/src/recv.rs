@@ -13,16 +13,16 @@ use std::sync::Arc;
 use aetherlink_proto::chunk::{self, ChunkLayout, Hash};
 use aetherlink_proto::frame::{FrameHeader, MsgType, HEADER_LEN};
 use aetherlink_proto::{sanitize_relative_path, ChunkBitmap};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpListener;
 use tokio::sync::Mutex;
-use tokio_rustls::TlsAcceptor;
 
 use crate::control::{self, Body, ControlMessage, FileProgress, ManifestAccept, TransferComplete};
 use crate::io::{verify_and_write, SinkFile};
+use crate::link::{Acceptor, Dialer, StreamSource};
 use crate::progress::{NoProgress, ProgressSink};
 use crate::resume::{self, StateKey};
-use crate::tls::HostIdentity;
+use crate::tls::{Fingerprint, HostIdentity};
 use crate::{Config, Error, TransferStats};
 
 /// Per-file receive state, shared by every stream worker.
@@ -40,7 +40,8 @@ struct FileState {
     checkpointing: Mutex<()>,
 }
 
-/// Runs one receive session and returns once the transfer completes.
+/// Receives as the device that **hosts** the network — it accepts, and the peer
+/// dials in. This is the iOS-to-Android direction.
 pub async fn receive(
     listener: &TcpListener,
     identity: &HostIdentity,
@@ -50,7 +51,7 @@ pub async fn receive(
     receive_with_progress(listener, identity, output_dir, config, Arc::new(NoProgress)).await
 }
 
-/// As [`receive`], reporting progress to `progress` as chunks land.
+/// As [`receive`], reporting progress as chunks land.
 ///
 /// Wrap the sink in [`crate::Throttled`] before passing it: stream workers call
 /// it on every completed chunk, which at 1 GB/s is 250 events a second.
@@ -61,11 +62,44 @@ pub async fn receive_with_progress(
     config: &Config,
     progress_sink: Arc<dyn ProgressSink>,
 ) -> Result<TransferStats, Error> {
-    let acceptor = TlsAcceptor::from(identity.server_config()?);
+    let mut source = Acceptor::new(listener, identity, config)?;
+    run(&mut source, output_dir, config, progress_sink).await
+}
 
-    // The sender opens the control stream first and waits for our Accept before
-    // opening any data stream, so the first connection is unambiguously it.
-    let mut control = accept_one(listener, &acceptor).await?;
+/// Receives as the device that **joined** the network — it dials the host.
+/// This is the Android-to-iOS direction, and the common one: Android holds the
+/// known address even when it is the sender, so iOS dials in to be sent to.
+pub async fn receive_as_client(
+    addr: &str,
+    pinned: Fingerprint,
+    output_dir: &Path,
+    config: &Config,
+) -> Result<TransferStats, Error> {
+    receive_as_client_with_progress(addr, pinned, output_dir, config, Arc::new(NoProgress)).await
+}
+
+/// As [`receive_as_client`], with progress reporting.
+pub async fn receive_as_client_with_progress(
+    addr: &str,
+    pinned: Fingerprint,
+    output_dir: &Path,
+    config: &Config,
+    progress_sink: Arc<dyn ProgressSink>,
+) -> Result<TransferStats, Error> {
+    let mut source = Dialer::new(addr, pinned, config)?;
+    run(&mut source, output_dir, config, progress_sink).await
+}
+
+/// The receive itself, independent of who dialled whom.
+async fn run<S: StreamSource>(
+    source: &mut S,
+    output_dir: &Path,
+    config: &Config,
+    progress_sink: Arc<dyn ProgressSink>,
+) -> Result<TransferStats, Error> {
+    // Control first, then data, on both sides — so a dialer on one end pairs
+    // with an acceptor on the other without either needing to know which it is.
+    let mut control = source.next_stream().await?;
     let stream_count = match control::read_control(&mut control).await? {
         Body::Hello(h) => {
             if h.protocol_version != aetherlink_proto::PROTOCOL_VERSION as u32 {
@@ -205,7 +239,7 @@ pub async fn receive_with_progress(
     let mut workers = Vec::new();
 
     for _ in 0..stream_count {
-        let mut stream = accept_one(listener, &acceptor).await?;
+        let mut stream = source.next_stream().await?;
         match control::read_control(&mut stream).await? {
             Body::Hello(_) => {}
             other => return Err(Error::Protocol(format!("expected Hello, got {other:?}"))),
@@ -282,8 +316,8 @@ pub async fn receive_with_progress(
 
 /// Reads frames until the peer closes the stream, accumulating whole chunks.
 #[allow(clippy::too_many_arguments)]
-async fn drain_stream(
-    stream: &mut tokio_rustls::server::TlsStream<TcpStream>,
+async fn drain_stream<S: AsyncRead + Unpin>(
+    stream: &mut S,
     files: Arc<HashMap<u64, Arc<FileState>>>,
     counter: Arc<AtomicU64>,
     chunk_size: u32,
@@ -445,24 +479,9 @@ async fn checkpoint(state: &Arc<FileState>) -> Result<(), Error> {
     .map_err(|e| Error::Io(format!("checkpoint worker panicked: {e}")))?
 }
 
-async fn accept_one(
-    listener: &TcpListener,
-    acceptor: &TlsAcceptor,
-) -> Result<tokio_rustls::server::TlsStream<TcpStream>, Error> {
-    let (tcp, _peer) = listener
-        .accept()
-        .await
-        .map_err(|e| Error::Io(format!("accepting connection: {e}")))?;
-    tcp.set_nodelay(true).ok();
-    acceptor
-        .accept(tcp)
-        .await
-        .map_err(|e| Error::Tls(format!("handshake: {e}")))
-}
-
 /// Best-effort notice to the peer before we drop the session. The local error
 /// is what the caller sees; failing to deliver this does not change it.
-async fn abort(control: &mut tokio_rustls::server::TlsStream<TcpStream>, reason: &str) {
+async fn abort<W: AsyncWrite + Unpin>(control: &mut W, reason: &str) {
     let msg = ControlMessage::new(Body::Abort(control::Abort {
         reason: reason.to_string(),
     }));

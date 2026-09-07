@@ -48,6 +48,10 @@ Pure logic, no I/O, no async runtime.
 - `resume` — durable `.aether_state` sidecar, plus a rebuild-by-verification
   fallback. **Resume across reconnect works end to end**: an interrupted
   transfer leaves a record, and the next attempt sends only what is missing.
+- `platform` — `fallocate` / `F_PREALLOCATE`, `IP_BOUND_IF` interface pinning,
+  and socket buffer sizing.
+- `link` — `StreamSource`, which separates *who dials* from *who sends*, so the
+  network host can transmit as well as receive.
 
 ### `core/crates/aetherlink-cli` — harness
 `aetherlink recv | send | bench`. The `bench` subcommand settles PRD §2.4.
@@ -64,7 +68,7 @@ take `&self` (state lives behind interior mutability), and foreign traits arrive
 as `Arc<dyn Trait>`, not `Box`.
 
 ### Verified results
-- **87 tests green**, clippy clean at `-D warnings`, CI on every push.
+- **99 tests green**, clippy clean at `-D warnings`, CI on every push.
 - **1.24 GB/s peak** over loopback with full TLS + BLAKE3 — meets the 1.2 GB/s
   software-ceiling gate. Caveats in `benchmarks.md`.
 
@@ -113,14 +117,13 @@ targets and possibly the transport choice change. Do not skip this.
 - [ ] PhotoKit ingestion with `shouldMoveFile = true`, preserving `creationDate`
 
 ### 5. Engine work still outstanding
-- [ ] **Real pre-allocation.** `io::SinkFile::create` uses `set_len`, which
-      reserves size but not blocks. Needs `fallocate` on Android and
-      `F_PREALLOCATE` on iOS; both want a `libc` dependency.
-- [ ] **`bound_interface_index` is in `Config` but unused.** iOS needs it
-      applied via `setsockopt(IP_BOUND_IF)` on every socket.
-- [ ] Bidirectional transfer (currently sender-connects, receiver-listens only)
-- [ ] Socket buffer tuning (`SO_SNDBUF`/`SO_RCVBUF`) — needs `socket2`
-- [ ] Adaptive stream count and frame size under thermal pressure
+- [ ] **Full-duplex.** Both directions work, but not simultaneously — one
+      session carries one direction. PRD §9.3 defers this to v2; nothing in the
+      MVP needs it.
+- [ ] Adaptive stream count and frame size under thermal pressure (Sprint 4;
+      needs thermal signals from the platform layer)
+- [ ] `MADV_DONTNEED` behind the sender's read cursor, so a 10 GB file does not
+      evict the page cache (PRD §5.5 asks for it; not yet implemented)
 
 ### 6. Spec corrections to fold back into PRD-v1.1
 - [ ] §5.3 says the frame header is 24 bytes. Its own fields sum to 28; the
@@ -163,6 +166,14 @@ write that had already completed. Snapshotting after the fsync would invert
 this and could record a chunk still sitting in the page cache — which is
 exactly the silently-corrupt-file failure the design exists to prevent.
 
+**Interface pinning is iOS-only, by design.** `bind_to_interface` uses
+`IP_BOUND_IF`, which is Darwin. On Android the equivalent is
+`ConnectivityManager.bindProcessToNetwork` in Kotlin — `SO_BINDTODEVICE` needs
+`CAP_NET_RAW`, which an app does not have. Passing a non-zero index on Android
+returns an error naming the alternative rather than silently doing nothing.
+**Without one or the other, Android routes our sockets to mobile data and the
+transfer fails silently** — the direct link has no gateway.
+
 **`Cargo.lock` is gitignored.** Fine for a library workspace, but pin it before
 shipping binaries so builds are reproducible.
 
@@ -172,7 +183,7 @@ shipping binaries so builds are reproducible.
 
 ```sh
 cd core
-cargo test --workspace                       # 87 tests
+cargo test --workspace                       # 99 tests
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 
@@ -211,13 +222,15 @@ class Transfers : TransferObserver {
         observer = this,
     )
 
-    fun host(destination: File): HostHandle =
-        // Port 0 lets the OS choose; the real port comes back in the handle.
-        session.startHost(port = 0u, outputDir = destination.absolutePath)
+    // Android hosts the network either way, so it always has a HostHandle to
+    // put in the QR. Port 0 lets the OS choose; the real port comes back.
+    fun hostAndReceive(destination: File): HostHandle =
+        session.startHostReceiving(port = 0u, outputDir = destination.absolutePath)
             .also { qr.encode(it.fingerprintHex, it.port) }
 
-    fun send(hostIp: String, port: UShort, fingerprint: String, files: List<FileItem>) =
-        session.startClient(hostIp, port, fingerprint, files)
+    fun hostAndSend(files: List<FileItem>): HostHandle =
+        session.startHostSending(port = 0u, files = files)
+            .also { qr.encode(it.fingerprintHex, it.port) }
 
     override fun onProgress(bytesDone: ULong, bytesTotal: ULong, megabytesPerSecond: Double) {
         mainHandler.post { progressBar.setProgress(bytesDone, bytesTotal) }
@@ -235,10 +248,18 @@ class Transfers : TransferObserver {
 final class Transfers: TransferObserver {
     private lazy var session = try! EngineSession(config: TransferConfig(), observer: self)
 
-    func host(destination: URL) throws -> HostHandle {
-        let handle = try session.startHost(port: 0, outputDir: destination.path)
-        qr.encode(fingerprint: handle.fingerprintHex, port: handle.port)
-        return handle
+    // iOS always joins, never hosts, so it is always a client — but it can be
+    // on either end of the data flow.
+    func sendToHost(_ files: [FileItem], at handle: ScannedQR) throws {
+        try session.startClientSending(
+            hostIp: handle.ip, port: handle.port,
+            fingerprintHex: handle.fingerprint, files: files)
+    }
+
+    func receiveFromHost(_ handle: ScannedQR, into destination: URL) throws {
+        try session.startClientReceiving(
+            hostIp: handle.ip, port: handle.port,
+            fingerprintHex: handle.fingerprint, outputDir: destination.path)
     }
 
     func onProgress(bytesDone: UInt64, bytesTotal: UInt64, megabytesPerSecond: Double) {
@@ -250,6 +271,21 @@ final class Transfers: TransferObserver {
     func onError(message: String) { /* ... */ }
 }
 ```
+
+### The four entry points
+
+Transport role is fixed by the topology — **iOS always dials, Android always
+accepts**, because only Android can host the network and therefore only Android
+has an address the other side knows in advance. Data direction is independent
+of that, which is why there are four methods rather than two:
+
+| | Android (hosts the network) | iOS (joins it) |
+|---|---|---|
+| **Android → iOS** | `startHostSending` | `startClientReceiving` |
+| **iOS → Android** | `startHostReceiving` | `startClientSending` |
+
+iOS must also set `boundInterfaceIndex` to `if_nametoindex("en0")`, or the OS
+routes the sockets over cellular where they reach nothing.
 
 ### Notes
 

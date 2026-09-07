@@ -20,7 +20,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Receive files, printing the fingerprint a sender must pin.
+    /// Host the link and receive. Prints the fingerprint the peer must pin.
     Recv {
         #[arg(long, default_value_t = 52080)]
         port: u16,
@@ -29,7 +29,7 @@ enum Command {
         #[command(flatten)]
         tuning: Tuning,
     },
-    /// Send files to a receiver.
+    /// Join a host's link and send to it.
     Send {
         addr: String,
         /// Fingerprint printed by `recv`, as 64 hex characters.
@@ -37,6 +37,27 @@ enum Command {
         fingerprint: String,
         #[arg(required = true)]
         files: Vec<PathBuf>,
+        #[command(flatten)]
+        tuning: Tuning,
+    },
+    /// Host the link and send. The peer dials in to be sent to — this is the
+    /// Android-to-iOS direction, where the host owns the known address but is
+    /// the one transmitting.
+    HostSend {
+        #[arg(long, default_value_t = 52080)]
+        port: u16,
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
+        #[command(flatten)]
+        tuning: Tuning,
+    },
+    /// Join a host's link and receive what it sends.
+    ClientRecv {
+        addr: String,
+        #[arg(long)]
+        fingerprint: String,
+        #[arg(long, default_value = "./received")]
+        out: PathBuf,
         #[command(flatten)]
         tuning: Tuning,
     },
@@ -105,22 +126,32 @@ async fn main() -> Result<()> {
             tuning,
         } => {
             let pinned = parse_fingerprint(&fingerprint)?;
-            let outgoing = files
-                .into_iter()
-                .map(|path| {
-                    let name = path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "file.bin".into());
-                    OutgoingFile {
-                        path,
-                        relative_path: name,
-                        mime_type: "application/octet-stream".into(),
-                    }
-                })
-                .collect();
-            let stats = send::send(&addr, pinned, outgoing, &tuning.config()).await?;
+            let stats = send::send(&addr, pinned, to_outgoing(files), &tuning.config()).await?;
             report("sent", &stats);
+        }
+        Command::HostSend {
+            port,
+            files,
+            tuning,
+        } => {
+            let identity = HostIdentity::generate()?;
+            let listener = recv::bind(port).await?;
+            println!("listening on {}", listener.local_addr()?);
+            println!("fingerprint  {}", identity.fingerprint_hex());
+            let stats =
+                send::send_as_host(&listener, &identity, to_outgoing(files), &tuning.config())
+                    .await?;
+            report("sent", &stats);
+        }
+        Command::ClientRecv {
+            addr,
+            fingerprint,
+            out,
+            tuning,
+        } => {
+            let pinned = parse_fingerprint(&fingerprint)?;
+            let stats = recv::receive_as_client(&addr, pinned, &out, &tuning.config()).await?;
+            report("received", &stats);
         }
         Command::Bench {
             size_mib,
@@ -130,6 +161,23 @@ async fn main() -> Result<()> {
         } => bench(size_mib, &dir, runs, tuning.config()).await?,
     }
     Ok(())
+}
+
+fn to_outgoing(files: Vec<PathBuf>) -> Vec<OutgoingFile> {
+    files
+        .into_iter()
+        .map(|path| {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "file.bin".into());
+            OutgoingFile {
+                path,
+                relative_path: name,
+                mime_type: "application/octet-stream".into(),
+            }
+        })
+        .collect()
 }
 
 fn parse_fingerprint(hex: &str) -> Result<[u8; 32]> {

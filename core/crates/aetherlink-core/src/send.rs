@@ -13,14 +13,14 @@ use std::sync::Arc;
 use aetherlink_proto::frame::{FrameHeader, MsgType, HEADER_LEN};
 use aetherlink_proto::{ChunkBitmap, SessionId};
 use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
+use tokio::net::TcpListener;
 use tokio::sync::Mutex;
-use tokio_rustls::TlsConnector;
 
 use crate::control::{self, Body, ControlMessage, FileEntry, Hello, ManifestOffer};
 use crate::io::SourceFile;
+use crate::link::{Acceptor, Dialer, StreamSource};
 use crate::progress::{NoProgress, ProgressSink};
-use crate::tls;
+use crate::tls::{Fingerprint, HostIdentity};
 use crate::{Config, Error, TransferStats};
 
 /// One file the caller wants to send.
@@ -37,9 +37,11 @@ struct WorkItem {
     chunk_index: u64,
 }
 
+/// Sends as the device that **joined** the network — it dials the host.
+/// This is the iOS-to-Android direction.
 pub async fn send(
     addr: &str,
-    pinned: tls::Fingerprint,
+    pinned: Fingerprint,
     files: Vec<OutgoingFile>,
     config: &Config,
 ) -> Result<TransferStats, Error> {
@@ -50,15 +52,47 @@ pub async fn send(
 /// [`crate::Throttled`] before passing it.
 pub async fn send_with_progress(
     addr: &str,
-    pinned: tls::Fingerprint,
+    pinned: Fingerprint,
     files: Vec<OutgoingFile>,
     config: &Config,
     progress: Arc<dyn ProgressSink>,
 ) -> Result<TransferStats, Error> {
-    let connector = TlsConnector::from(tls::client_config(pinned)?);
-    let server_name = rustls::pki_types::ServerName::try_from(tls::SERVER_NAME)
-        .map_err(|e| Error::Tls(format!("invalid server name: {e}")))?;
+    let mut source = Dialer::new(addr, pinned, config)?;
+    run(&mut source, files, config, progress).await
+}
 
+/// Sends as the device that **hosts** the network — it accepts, and the peer
+/// dials in. This is the Android-to-iOS direction, and it is the common one:
+/// iOS cannot host a network, so Android holds the known address even when it
+/// is the one transmitting.
+pub async fn send_as_host(
+    listener: &TcpListener,
+    identity: &HostIdentity,
+    files: Vec<OutgoingFile>,
+    config: &Config,
+) -> Result<TransferStats, Error> {
+    send_as_host_with_progress(listener, identity, files, config, Arc::new(NoProgress)).await
+}
+
+/// As [`send_as_host`], with progress reporting.
+pub async fn send_as_host_with_progress(
+    listener: &TcpListener,
+    identity: &HostIdentity,
+    files: Vec<OutgoingFile>,
+    config: &Config,
+    progress: Arc<dyn ProgressSink>,
+) -> Result<TransferStats, Error> {
+    let mut source = Acceptor::new(listener, identity, config)?;
+    run(&mut source, files, config, progress).await
+}
+
+/// The transfer itself, independent of who dialled whom.
+async fn run<S: StreamSource>(
+    source: &mut S,
+    files: Vec<OutgoingFile>,
+    config: &Config,
+    progress: Arc<dyn ProgressSink>,
+) -> Result<TransferStats, Error> {
     // Map and hash every source before offering, so the manifest can commit to
     // the chunk hashes the receiver verifies against.
     let mut sources = Vec::with_capacity(files.len());
@@ -83,7 +117,7 @@ pub async fn send_with_progress(
     let session_id = SessionId(rand_bytes());
 
     // --- control stream -----------------------------------------------------
-    let mut control = connect(&connector, &server_name, addr).await?;
+    let mut control = source.next_stream().await?;
     control::write_control(
         &mut control,
         &ControlMessage::new(Body::Hello(Hello {
@@ -145,7 +179,7 @@ pub async fn send_with_progress(
     // --- data streams -------------------------------------------------------
     let mut workers = Vec::with_capacity(config.stream_count as usize);
     for stream_index in 1..=config.stream_count {
-        let mut stream = connect(&connector, &server_name, addr).await?;
+        let mut stream = source.next_stream().await?;
         control::write_control(
             &mut stream,
             &ControlMessage::new(Body::Hello(Hello {
@@ -225,22 +259,6 @@ pub async fn send_with_progress(
         Body::Abort(a) => Err(Error::PeerAborted(a.reason)),
         other => Err(Error::Protocol(format!("expected Complete, got {other:?}"))),
     }
-}
-
-async fn connect(
-    connector: &TlsConnector,
-    server_name: &rustls::pki_types::ServerName<'static>,
-    addr: &str,
-) -> Result<tokio_rustls::client::TlsStream<TcpStream>, Error> {
-    let tcp = TcpStream::connect(addr)
-        .await
-        .map_err(|e| Error::Io(format!("connecting to {addr}: {e}")))?;
-    // Bulk transfer: never let Nagle hold a partial frame.
-    tcp.set_nodelay(true).ok();
-    connector
-        .connect(server_name.clone(), tcp)
-        .await
-        .map_err(|e| Error::Tls(format!("handshake with {addr}: {e}")))
 }
 
 /// Session nonce. Not a secret — the pinned certificate is what authenticates

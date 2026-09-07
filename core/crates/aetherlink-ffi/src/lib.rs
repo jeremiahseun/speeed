@@ -49,6 +49,23 @@ pub struct TransferConfig {
     /// throughput. Zero leaves only the final checkpoint.
     #[uniffi(default = 67108864)]
     pub checkpoint_bytes: u64,
+    /// Network interface to pin sockets to, or 0 to leave routing alone.
+    ///
+    /// **iOS must set this**, to `if_nametoindex("en0")`. The direct link has
+    /// no gateway, so without it the OS routes our sockets over cellular where
+    /// they reach nothing. On Android leave it at 0 and bind the process with
+    /// `ConnectivityManager.bindProcessToNetwork` instead — a non-zero value
+    /// here is rejected rather than silently ignored.
+    #[uniffi(default = 0)]
+    pub bound_interface_index: u32,
+    /// Socket buffer sizes in bytes, or 0 for the kernel default. Zero is
+    /// usually right: setting these turns off receive-buffer autotuning, which
+    /// generally beats a fixed number on this link. For measurement, not
+    /// because the default is wrong.
+    #[uniffi(default = 0)]
+    pub socket_send_buffer_bytes: u32,
+    #[uniffi(default = 0)]
+    pub socket_recv_buffer_bytes: u32,
 }
 
 impl Default for TransferConfig {
@@ -61,6 +78,9 @@ impl Default for TransferConfig {
             max_file_bytes: 2 << 40,
             resume: true,
             checkpoint_bytes: 64 * 1024 * 1024,
+            bound_interface_index: 0,
+            socket_send_buffer_bytes: 0,
+            socket_recv_buffer_bytes: 0,
         }
     }
 }
@@ -79,6 +99,9 @@ impl TransferConfig {
             max_file_bytes: self.max_file_bytes,
             resume: self.resume,
             checkpoint_bytes: self.checkpoint_bytes,
+            bound_interface_index: self.bound_interface_index,
+            socket_send_buffer_bytes: self.socket_send_buffer_bytes,
+            socket_recv_buffer_bytes: self.socket_recv_buffer_bytes,
         }
     }
 }
@@ -215,55 +238,52 @@ impl EngineSession {
         }))
     }
 
-    /// Binds a listener and returns what the QR payload needs. The transfer
-    /// itself runs in the background; results arrive on the observer.
+    /// Hosts the network and **receives**. Binds a listener and returns what
+    /// the QR payload needs; the transfer runs in the background and results
+    /// arrive on the observer.
     ///
     /// Pass `port = 0` to let the OS choose; the assigned port comes back in
     /// the handle.
-    pub fn start_host(&self, port: u16, output_dir: String) -> Result<HostHandle, EngineError> {
-        self.claim()?;
-
-        let identity = HostIdentity::generate().map_err(EngineError::from)?;
-        let fingerprint_hex = identity.fingerprint_hex();
-
-        // Binding is effectively instant, and the caller needs the real port
-        // before it can render a QR code, so this one step is synchronous.
-        let listener = match self.runtime.block_on(recv::bind(port)) {
-            Ok(l) => l,
-            Err(e) => {
-                // Hand the slot back; a failed bind is not a running session.
-                self.running.store(false, Ordering::SeqCst);
-                return Err(e.into());
-            }
-        };
-        let bound_port = listener
-            .local_addr()
-            .map_err(|e| EngineError::Engine(format!("reading bound port: {e}")))?
-            .port();
-
+    pub fn start_host_receiving(
+        &self,
+        port: u16,
+        output_dir: String,
+    ) -> Result<HostHandle, EngineError> {
+        let (handle, listener, identity) = self.bind_host(port)?;
         let config = self.config.resolve();
-        let observer = self.observer.clone();
-        let sink: Arc<dyn ProgressSink> =
-            Arc::new(Throttled::with_default_interval(Arc::new(ObserverBridge {
-                observer: observer.clone(),
-                started: Instant::now(),
-            })));
+        let sink = self.sink();
         let out = PathBuf::from(output_dir);
 
         self.set_state(SessionState::Listening);
         self.spawn(async move {
             recv::receive_with_progress(&listener, &identity, &out, &config, sink).await
         });
-
-        Ok(HostHandle {
-            port: bound_port,
-            fingerprint_hex,
-        })
+        Ok(handle)
     }
 
-    /// Connects to a host, pinning `fingerprint_hex` from its QR payload, and
-    /// sends `files`.
-    pub fn start_client(
+    /// Hosts the network and **sends**. This is the Android-to-iOS direction:
+    /// iOS cannot host a network, so Android keeps the known address even when
+    /// it is the one transmitting, and the iPhone dials in to be sent to.
+    pub fn start_host_sending(
+        &self,
+        port: u16,
+        files: Vec<FileItem>,
+    ) -> Result<HostHandle, EngineError> {
+        let (handle, listener, identity) = self.bind_host(port)?;
+        let config = self.config.resolve();
+        let sink = self.sink();
+        let outgoing = to_outgoing(files);
+
+        self.set_state(SessionState::Listening);
+        self.spawn(async move {
+            send::send_as_host_with_progress(&listener, &identity, outgoing, &config, sink).await
+        });
+        Ok(handle)
+    }
+
+    /// Joins the host's network and **sends**. This is the iOS-to-Android
+    /// direction. `fingerprint_hex` comes from the host's QR payload.
+    pub fn start_client_sending(
         &self,
         host_ip: String,
         port: u16,
@@ -273,28 +293,38 @@ impl EngineSession {
         let pinned = parse_fingerprint(&fingerprint_hex)?;
         self.claim()?;
 
-        let outgoing: Vec<OutgoingFile> = files
-            .into_iter()
-            .map(|f| OutgoingFile {
-                path: PathBuf::from(f.path),
-                relative_path: f.relative_path,
-                mime_type: f.mime_type,
-            })
-            .collect();
-
         let addr = format!("{host_ip}:{port}");
         let config = self.config.resolve();
-        let sink: Arc<dyn ProgressSink> =
-            Arc::new(Throttled::with_default_interval(Arc::new(ObserverBridge {
-                observer: self.observer.clone(),
-                started: Instant::now(),
-            })));
+        let sink = self.sink();
+        let outgoing = to_outgoing(files);
 
         self.set_state(SessionState::Transferring);
         self.spawn(async move {
             send::send_with_progress(&addr, pinned, outgoing, &config, sink).await
         });
+        Ok(())
+    }
 
+    /// Joins the host's network and **receives** what it sends.
+    pub fn start_client_receiving(
+        &self,
+        host_ip: String,
+        port: u16,
+        fingerprint_hex: String,
+        output_dir: String,
+    ) -> Result<(), EngineError> {
+        let pinned = parse_fingerprint(&fingerprint_hex)?;
+        self.claim()?;
+
+        let addr = format!("{host_ip}:{port}");
+        let config = self.config.resolve();
+        let sink = self.sink();
+        let out = PathBuf::from(output_dir);
+
+        self.set_state(SessionState::Transferring);
+        self.spawn(async move {
+            recv::receive_as_client_with_progress(&addr, pinned, &out, &config, sink).await
+        });
         Ok(())
     }
 
@@ -320,6 +350,48 @@ impl EngineSession {
 }
 
 impl EngineSession {
+    /// Claims the session, generates an identity and binds a listener. Shared
+    /// by both host roles, which differ only in what runs afterwards.
+    fn bind_host(
+        &self,
+        port: u16,
+    ) -> Result<(HostHandle, tokio::net::TcpListener, HostIdentity), EngineError> {
+        self.claim()?;
+        let identity = HostIdentity::generate().map_err(EngineError::from)?;
+        let fingerprint_hex = identity.fingerprint_hex();
+
+        // Binding is effectively instant, and the caller needs the real port
+        // before it can render a QR code, so this one step is synchronous.
+        let listener = match self.runtime.block_on(recv::bind(port)) {
+            Ok(l) => l,
+            Err(e) => {
+                // Hand the slot back; a failed bind is not a running session.
+                self.running.store(false, Ordering::SeqCst);
+                return Err(e.into());
+            }
+        };
+        let bound_port = listener
+            .local_addr()
+            .map_err(|e| EngineError::Engine(format!("reading bound port: {e}")))?
+            .port();
+
+        Ok((
+            HostHandle {
+                port: bound_port,
+                fingerprint_hex,
+            },
+            listener,
+            identity,
+        ))
+    }
+
+    fn sink(&self) -> Arc<dyn ProgressSink> {
+        Arc::new(Throttled::with_default_interval(Arc::new(ObserverBridge {
+            observer: self.observer.clone(),
+            started: Instant::now(),
+        })))
+    }
+
     fn claim(&self) -> Result<(), EngineError> {
         if self.running.swap(true, Ordering::SeqCst) {
             return Err(EngineError::Busy);
@@ -377,6 +449,17 @@ impl Reporter {
         self.observer.on_state_changed(SessionState::Failed);
         self.observer.on_error(message.to_string());
     }
+}
+
+fn to_outgoing(files: Vec<FileItem>) -> Vec<OutgoingFile> {
+    files
+        .into_iter()
+        .map(|f| OutgoingFile {
+            path: PathBuf::from(f.path),
+            relative_path: f.relative_path,
+            mime_type: f.mime_type,
+        })
+        .collect()
 }
 
 fn parse_fingerprint(hex: &str) -> Result<[u8; 32], EngineError> {

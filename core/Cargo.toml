@@ -15,6 +15,7 @@ clap = { version = "4", features = ["derive"] }
 uniffi = "0.32"
 anyhow = "1"
 blake3 = "1.5"
+libc = "0.2"
 memmap2 = "0.9"
 prost = "0.13"
 rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }

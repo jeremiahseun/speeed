@@ -10,6 +10,8 @@
 
 pub mod control;
 pub mod io;
+pub mod link;
+pub mod platform;
 pub mod progress;
 pub mod recv;
 pub mod resume;
@@ -17,8 +19,8 @@ pub mod send;
 pub mod tls;
 
 pub use progress::{NoProgress, ProgressSink, Throttled};
-pub use recv::{receive, receive_with_progress};
-pub use send::{send, send_with_progress, OutgoingFile};
+pub use recv::{receive, receive_as_client, receive_with_progress};
+pub use send::{send, send_as_host, send_with_progress, OutgoingFile};
 pub use tls::{Fingerprint, HostIdentity};
 
 /// Wire protocol version this build speaks.
@@ -50,6 +52,22 @@ pub struct Config {
     /// trades resume granularity against write throughput. Zero disables
     /// checkpointing, leaving only the final one.
     pub checkpoint_bytes: u64,
+    /// Network interface to pin sockets to, or 0 to leave routing alone.
+    ///
+    /// This is for iOS: the direct link has no gateway, so the OS will route
+    /// our sockets out over cellular where they reach nothing. Pass
+    /// `if_nametoindex("en0")`. On Android the equivalent is
+    /// `ConnectivityManager.bindProcessToNetwork` in the Kotlin layer, and a
+    /// non-zero value here is rejected rather than silently ignored.
+    pub bound_interface_index: u32,
+    /// `SO_SNDBUF` / `SO_RCVBUF` in bytes, or 0 for the kernel default.
+    ///
+    /// **Zero is usually right.** Setting these explicitly turns off Linux's
+    /// receive-buffer autotuning, which on a link whose bandwidth-delay product
+    /// is around 100 KB generally does a better job than a fixed number. The
+    /// knob exists for measuring, not because the default is wrong.
+    pub socket_send_buffer_bytes: u32,
+    pub socket_recv_buffer_bytes: u32,
 }
 
 impl Default for Config {
@@ -62,6 +80,9 @@ impl Default for Config {
             max_file_bytes: 2 << 40, // 2 TiB
             resume: true,
             checkpoint_bytes: resume::DEFAULT_CHECKPOINT_BYTES,
+            bound_interface_index: 0,
+            socket_send_buffer_bytes: 0,
+            socket_recv_buffer_bytes: 0,
         }
     }
 }

@@ -73,6 +73,34 @@ still the number that decides whether the product hits Tier B.** This result
 only establishes that when the radio delivers 45–110 MB/s, the engine will not
 be what caps it — it has roughly 10× of headroom.
 
+---
+
+## After real pre-allocation and role decoupling
+
+Re-run of the same configuration once `fallocate`/`F_PREALLOCATE` replaced
+`ftruncate` on the receive path.
+
+| Payload | Best | Mean | Was (best) |
+|---|---|---|---|
+| 512 MiB, 4 streams | **2188 MB/s** | 1270–1968 MB/s | 1288 MB/s |
+
+**Pre-allocation roughly doubled peak throughput.** `ftruncate` sets a length
+and nothing else, so every page of the destination was faulted in on first
+write, on the hot path, while the socket waited. Reserving the blocks up front
+moves that work out of the transfer. The effect is exaggerated here because the
+destination is tmpfs — page allocation *is* the write — but the same mechanism
+applies to a real filesystem, which is why PRD §5.5 asked for it.
+
+Mean stays well below best because the first run of each batch is cold. Read
+the best figure as the ceiling and the mean as a reminder that the first
+transfer after boot pays for warming the cache.
+
+CLI check of the host-sends direction, 40 MB over loopback:
+
+```
+sent        1099.88 MB/s   received    1095.22 MB/s   bytes match
+```
+
 ### Reproducing
 
 ```sh

@@ -96,15 +96,10 @@ impl SinkFile {
             .open(path)
             .map_err(|e| Error::Io(format!("creating {}: {e}", path.display())))?;
 
-        // Reserve the full extent up front so the filesystem does not fragment
-        // it under sustained write load.
-        //
-        // NOTE: `set_len` is ftruncate, which reserves the *size* but not the
-        // blocks. The platform layer replaces this with `fallocate` on Android
-        // and `F_PREALLOCATE` on iOS (PRD §5.5); both need a libc dependency
-        // that the harness does not yet carry.
-        file.set_len(size)
-            .map_err(|e| Error::Io(format!("pre-allocating {}: {e}", path.display())))?;
+        // Reserve real disk blocks, not just a length, so the filesystem does
+        // not fragment the file under sustained write load. Falls back to
+        // ftruncate where the filesystem cannot pre-allocate.
+        crate::platform::preallocate(&file, size)?;
 
         Ok(Self {
             file: Arc::new(file),

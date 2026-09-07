@@ -94,7 +94,7 @@ fn a_transfer_runs_end_to_end_through_the_ffi_surface() {
     let host_obs = Arc::new(Recorder::default());
     let host = EngineSession::new(small_config(), host_obs.clone()).unwrap();
     let handle = host
-        .start_host(0, dst_dir.0.to_string_lossy().into_owned())
+        .start_host_receiving(0, dst_dir.0.to_string_lossy().into_owned())
         .expect("host should bind");
 
     assert_ne!(
@@ -107,7 +107,7 @@ fn a_transfer_runs_end_to_end_through_the_ffi_surface() {
     let client_obs = Arc::new(Recorder::default());
     let client = EngineSession::new(small_config(), client_obs.clone()).unwrap();
     client
-        .start_client(
+        .start_client_sending(
             "127.0.0.1".into(),
             handle.port,
             handle.fingerprint_hex.clone(),
@@ -147,19 +147,71 @@ fn a_transfer_runs_end_to_end_through_the_ffi_surface() {
 }
 
 #[test]
+fn the_host_can_send_and_the_client_receive() {
+    // The Android-to-iOS direction: the host keeps the known address but is
+    // the one transmitting.
+    let src_dir = TempDir::new("hs-src");
+    let dst_dir = TempDir::new("hs-dst");
+    let payload: Vec<u8> = (0..(64 * 1024 * 2 + 7)).map(|i| (i % 253) as u8).collect();
+    let src = src_dir.0.join("photo.heic");
+    std::fs::write(&src, &payload).unwrap();
+
+    let host_obs = Arc::new(Recorder::default());
+    let host = EngineSession::new(small_config(), host_obs.clone()).unwrap();
+    let handle = host
+        .start_host_sending(
+            0,
+            vec![FileItem {
+                path: src.to_string_lossy().into_owned(),
+                relative_path: "photo.heic".into(),
+                mime_type: "image/heic".into(),
+            }],
+        )
+        .expect("host should bind and send");
+
+    let client_obs = Arc::new(Recorder::default());
+    let client = EngineSession::new(small_config(), client_obs.clone()).unwrap();
+    client
+        .start_client_receiving(
+            "127.0.0.1".into(),
+            handle.port,
+            handle.fingerprint_hex.clone(),
+            dst_dir.0.to_string_lossy().into_owned(),
+        )
+        .expect("client should start receiving");
+
+    assert_eq!(
+        client_obs.wait_for_terminal(Duration::from_secs(30)),
+        Some(SessionState::Completed),
+        "client errors: {:?}",
+        client_obs.errors.lock().unwrap()
+    );
+    assert_eq!(
+        host_obs.wait_for_terminal(Duration::from_secs(30)),
+        Some(SessionState::Completed),
+        "host errors: {:?}",
+        host_obs.errors.lock().unwrap()
+    );
+    assert_eq!(
+        std::fs::read(dst_dir.0.join("photo.heic")).unwrap(),
+        payload
+    );
+}
+
+#[test]
 fn the_session_is_reusable_after_a_transfer_completes() {
     let dst = TempDir::new("reuse");
     let obs = Arc::new(Recorder::default());
     let session = EngineSession::new(small_config(), obs.clone()).unwrap();
 
     let first = session
-        .start_host(0, dst.0.to_string_lossy().into_owned())
+        .start_host_receiving(0, dst.0.to_string_lossy().into_owned())
         .unwrap();
     session.cancel();
 
     // A cancelled session must hand its slot back, or every session object is
     // single-use and the app has to rebuild one per transfer.
-    let second = session.start_host(0, dst.0.to_string_lossy().into_owned());
+    let second = session.start_host_receiving(0, dst.0.to_string_lossy().into_owned());
     assert!(second.is_ok(), "session should be reusable, got {second:?}");
     assert_ne!(first.port, second.unwrap().port);
     session.cancel();
@@ -172,9 +224,9 @@ fn a_second_concurrent_start_is_refused() {
     let session = EngineSession::new(small_config(), obs).unwrap();
 
     session
-        .start_host(0, dst.0.to_string_lossy().into_owned())
+        .start_host_receiving(0, dst.0.to_string_lossy().into_owned())
         .unwrap();
-    let second = session.start_host(0, dst.0.to_string_lossy().into_owned());
+    let second = session.start_host_receiving(0, dst.0.to_string_lossy().into_owned());
     assert!(matches!(second, Err(EngineError::Busy)), "got {second:?}");
     session.cancel();
 }
@@ -185,7 +237,7 @@ fn a_malformed_fingerprint_is_rejected_before_any_socket_is_opened() {
     let session = EngineSession::new(small_config(), obs).unwrap();
 
     for bad in ["", "abc", &"z".repeat(64), &"aa".repeat(31)] {
-        let r = session.start_client("127.0.0.1".into(), 1234, bad.to_string(), vec![]);
+        let r = session.start_client_sending("127.0.0.1".into(), 1234, bad.to_string(), vec![]);
         assert!(
             matches!(r, Err(EngineError::BadFingerprint(_))),
             "{bad:?} -> {r:?}"
