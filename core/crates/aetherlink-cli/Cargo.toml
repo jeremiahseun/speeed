@@ -1,0 +1,15 @@
+[package]
+name = "aetherlink-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "aetherlink"
+path = "src/main.rs"
+
+[dependencies]
+aetherlink-core.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

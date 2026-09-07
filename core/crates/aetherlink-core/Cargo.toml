@@ -1,0 +1,22 @@
+[package]
+name = "aetherlink-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aetherlink-proto.workspace = true
+blake3.workspace = true
+memmap2.workspace = true
+prost.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
