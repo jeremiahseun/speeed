@@ -29,3 +29,20 @@ jobs:
         run: cargo clippy --all-targets --all-features
       - name: Test
         run: cargo test --all-features
+
+      # Bindings are generated from the built library's own metadata, so this
+      # catches an FFI surface that compiles but cannot be expressed in Kotlin
+      # or Swift.
+      - name: Generate bindings
+        run: |
+          cargo build --release -p aetherlink-ffi --bin uniffi-bindgen
+          for lang in kotlin swift; do
+            ./target/release/uniffi-bindgen generate \
+              --library target/release/libaetherlink_ffi.so \
+              --language "$lang" --out-dir "target/bindings/$lang" --no-format
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bindings
+          path: core/target/bindings/

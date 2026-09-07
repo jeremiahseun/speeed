@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/aetherlink-cli", "crates/aetherlink-core", "crates/aetherlink-proto"]
+members = ["crates/aetherlink-cli", "crates/aetherlink-ffi", "crates/aetherlink-core", "crates/aetherlink-proto"]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,6 +12,7 @@ license = "Apache-2.0"
 aetherlink-core = { path = "crates/aetherlink-core" }
 aetherlink-proto = { path = "crates/aetherlink-proto" }
 clap = { version = "4", features = ["derive"] }
+uniffi = "0.32"
 anyhow = "1"
 blake3 = "1.5"
 memmap2 = "0.9"

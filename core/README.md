@@ -10,8 +10,12 @@ See [`docs/PRD-v1.1.md`](../docs/PRD-v1.1.md) for the specification.
 | Crate | Status | Contents |
 |---|---|---|
 | `aetherlink-proto` | **implemented** | Frame header, chunk geometry, BLAKE3 verification, resume bitmap, manifest validation. Pure logic, no I/O. |
-| `aetherlink-core` | not started | Transport (multi-stream TCP + rustls), file I/O pipeline, session state machine. |
-| `aetherlink-cli` | not started | Test harness: `send`, `recv`, `bench`. |
+| `aetherlink-core` | **implemented** | Transport (multi-stream TCP + rustls), single-copy I/O pipeline, progress reporting. |
+| `aetherlink-cli` | **implemented** | Test harness: `send`, `recv`, `bench`. |
+| `aetherlink-ffi` | **implemented** | UniFFI surface for Kotlin and Swift. |
+
+See [`docs/STATUS.md`](../docs/STATUS.md) for what is done, what is next, and
+the traps worth knowing about before touching this code.
 
 ## Developing
 

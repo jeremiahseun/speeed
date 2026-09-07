@@ -1,0 +1,22 @@
+[package]
+name = "aetherlink-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+# `cdylib` is what Android loads via System.loadLibrary; `staticlib` is what the
+# iOS XCFramework links. `lib` keeps the crate usable from the bindgen binary.
+crate-type = ["cdylib", "staticlib", "lib"]
+name = "aetherlink_ffi"
+
+[[bin]]
+# Generates the Kotlin and Swift bindings. See scripts/ in the repo root.
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[dependencies]
+aetherlink-core.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+uniffi = { workspace = true, features = ["cli"] }

@@ -10,13 +10,18 @@
 
 pub mod control;
 pub mod io;
+pub mod progress;
 pub mod recv;
 pub mod send;
 pub mod tls;
 
-pub use recv::receive;
-pub use send::{send, OutgoingFile};
+pub use progress::{NoProgress, ProgressSink, Throttled};
+pub use recv::{receive, receive_with_progress};
+pub use send::{send, send_with_progress, OutgoingFile};
 pub use tls::{Fingerprint, HostIdentity};
+
+/// Wire protocol version this build speaks.
+pub use aetherlink_proto::PROTOCOL_VERSION;
 
 use aetherlink_proto::chunk::DEFAULT_CHUNK_SIZE;
 use aetherlink_proto::frame::DEFAULT_FRAME_PAYLOAD;

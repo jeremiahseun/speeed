@@ -20,6 +20,7 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::control::{self, Body, ControlMessage, FileProgress, ManifestAccept, TransferComplete};
 use crate::io::{verify_and_write, SinkFile};
+use crate::progress::{NoProgress, ProgressSink};
 use crate::tls::HostIdentity;
 use crate::{Config, Error, TransferStats};
 
@@ -37,6 +38,20 @@ pub async fn receive(
     identity: &HostIdentity,
     output_dir: &Path,
     config: &Config,
+) -> Result<TransferStats, Error> {
+    receive_with_progress(listener, identity, output_dir, config, Arc::new(NoProgress)).await
+}
+
+/// As [`receive`], reporting progress to `progress` as chunks land.
+///
+/// Wrap the sink in [`crate::Throttled`] before passing it: stream workers call
+/// it on every completed chunk, which at 1 GB/s is 250 events a second.
+pub async fn receive_with_progress(
+    listener: &TcpListener,
+    identity: &HostIdentity,
+    output_dir: &Path,
+    config: &Config,
+    progress_sink: Arc<dyn ProgressSink>,
 ) -> Result<TransferStats, Error> {
     let acceptor = TlsAcceptor::from(identity.server_config()?);
 
@@ -75,6 +90,7 @@ pub async fn receive(
     let mut accepted = Vec::new();
     let mut progress = Vec::new();
     let mut seen_paths = std::collections::HashSet::new();
+    let mut total_bytes = 0u64;
 
     for entry in &offer.files {
         let safe_path = match sanitize_relative_path(&entry.relative_path) {
@@ -121,6 +137,7 @@ pub async fn receive(
             have_bitmap: bitmap.as_bytes().to_vec(),
         });
         accepted.push(entry.file_id);
+        total_bytes += entry.size_bytes;
         files.insert(
             entry.file_id,
             Arc::new(FileState {
@@ -156,8 +173,17 @@ pub async fn receive(
         let files = files.clone();
         let counter = bytes_written.clone();
         let chunk_size = offer.chunk_size;
+        let progress_sink = progress_sink.clone();
         workers.push(tokio::spawn(async move {
-            drain_stream(&mut stream, files, counter, chunk_size).await
+            drain_stream(
+                &mut stream,
+                files,
+                counter,
+                chunk_size,
+                progress_sink,
+                total_bytes,
+            )
+            .await
         }));
     }
 
@@ -194,11 +220,14 @@ pub async fn receive(
 }
 
 /// Reads frames until the peer closes the stream, accumulating whole chunks.
+#[allow(clippy::too_many_arguments)]
 async fn drain_stream(
     stream: &mut tokio_rustls::server::TlsStream<TcpStream>,
     files: Arc<HashMap<u64, Arc<FileState>>>,
     counter: Arc<AtomicU64>,
     chunk_size: u32,
+    progress_sink: Arc<dyn ProgressSink>,
+    total_bytes: u64,
 ) -> Result<(), Error> {
     let mut header_buf = [0u8; HEADER_LEN];
     let mut buf: Vec<u8> = Vec::with_capacity(chunk_size as usize);
@@ -280,8 +309,17 @@ async fn drain_stream(
             .map_err(|e| Error::Io(format!("disk worker panicked: {e}")))?;
             result?;
 
-            state.bitmap.lock().await.set(chunk_index)?;
-            counter.fetch_add(expected_len as u64, Ordering::Relaxed);
+            let complete = {
+                let mut bitmap = state.bitmap.lock().await;
+                bitmap.set(chunk_index)?;
+                bitmap.is_complete()
+            };
+            let done =
+                counter.fetch_add(expected_len as u64, Ordering::Relaxed) + expected_len as u64;
+            progress_sink.on_progress(done, total_bytes);
+            if complete {
+                progress_sink.on_file_completed(file_id, &state.sink.path().to_string_lossy());
+            }
 
             buf = payload;
             buf.clear();

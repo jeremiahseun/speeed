@@ -19,6 +19,7 @@ use tokio_rustls::TlsConnector;
 
 use crate::control::{self, Body, ControlMessage, FileEntry, Hello, ManifestOffer};
 use crate::io::SourceFile;
+use crate::progress::{NoProgress, ProgressSink};
 use crate::tls;
 use crate::{Config, Error, TransferStats};
 
@@ -41,6 +42,18 @@ pub async fn send(
     pinned: tls::Fingerprint,
     files: Vec<OutgoingFile>,
     config: &Config,
+) -> Result<TransferStats, Error> {
+    send_with_progress(addr, pinned, files, config, Arc::new(NoProgress)).await
+}
+
+/// As [`send`], reporting progress as chunks go out. Wrap the sink in
+/// [`crate::Throttled`] before passing it.
+pub async fn send_with_progress(
+    addr: &str,
+    pinned: tls::Fingerprint,
+    files: Vec<OutgoingFile>,
+    config: &Config,
+    progress: Arc<dyn ProgressSink>,
 ) -> Result<TransferStats, Error> {
     let connector = TlsConnector::from(tls::client_config(pinned)?);
     let server_name = rustls::pki_types::ServerName::try_from(tls::SERVER_NAME)
@@ -125,6 +138,7 @@ pub async fn send(
     }
 
     let started = std::time::Instant::now();
+    let sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let queue = Arc::new(Mutex::new(queue));
     let sources = Arc::new(sources);
 
@@ -145,6 +159,8 @@ pub async fn send(
         let queue = queue.clone();
         let sources = sources.clone();
         let frame_size = config.frame_size;
+        let progress = progress.clone();
+        let sent = sent.clone();
         workers.push(tokio::spawn(async move {
             let mut header_buf = [0u8; HEADER_LEN];
             loop {
@@ -152,7 +168,7 @@ pub async fn send(
                 let Some(item) = item else { break };
 
                 let src = &sources[item.file_index];
-                let (chunk_offset, _) = src.layout().range(item.chunk_index)?;
+                let (chunk_offset, chunk_len) = src.layout().range(item.chunk_index)?;
                 let payload = src.chunk(item.chunk_index)?;
 
                 // One chunk goes out as a run of frames on this stream, in
@@ -170,6 +186,10 @@ pub async fn send(
                     stream.write_all(&header_buf).await?;
                     stream.write_all(part).await?;
                 }
+
+                let done = sent.fetch_add(chunk_len as u64, std::sync::atomic::Ordering::Relaxed)
+                    + chunk_len as u64;
+                progress.on_progress(done, bytes_to_send);
             }
             stream.flush().await?;
             stream.shutdown().await?;
